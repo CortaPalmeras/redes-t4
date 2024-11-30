@@ -48,6 +48,13 @@ def unpack_header(header: bytes) -> Header:
     return Header(*typing.cast(tuple[int, int, int, int, int, int, int], 
                                struct.unpack(f"{HEADER_FIELDS}I", header)))
 
+def ip_to_int(ip: str) -> int:
+    return int.from_bytes(socket.inet_aton(socket.gethostbyname(ip)))
+
+def int_to_ip(ip: int) -> str:
+    return socket.inet_ntoa(ip.to_bytes(4))
+
+
 class FragmentedMessage:
     def __init__(self, len: int) -> None:
         self.len: int = len
@@ -108,16 +115,118 @@ class Defragmenter:
             del self.messages[header.id]
             del self.timeouts[header.id]
             return ret
+    
+
+address_t: typing.TypeAlias = tuple[str, int]
+
+class RoutingTable:
+    def __init__(self, linked_addrs: list[str]) -> None:
+
+        self.mtus: dict[address_t, int] = dict()
+
+        for link in linked_addrs:
+            try: 
+                parts = link.split(':', maxsplit=2)
+                ip = socket.gethostbyname(parts[0])
+                port = int(parts[1])
+                mtu = int(parts[2])
+
+                if mtu <= HEADER_LEN:
+                    print((f"Error en el argumento '{link}', todos los MTUs deben"
+                           f"ser mayores al tamaño del header ({HEADER_LEN} bytes)"),
+                          file=sys.stderr)
+                    exit(1)
+
+                self.mtus[(ip,port)] = mtu
+
+            except:
+                print(f"Error de formato en el argumento '{link}'", file=sys.stderr)
+                exit(1)
+
+        self.direct_links: set[address_t] = set(self.mtus.keys())
+        self.max_mtu = max(self.mtus.values()) if len(self.mtus) > 0 else 0
+
+        self.routing_table: dict[address_t, list[address_t]] \
+                            = {addr: [addr] for addr in self.mtus.keys()}
+
+        self.distances: dict[address_t, int] = {addr: 1 for addr in self.mtus.keys()}
+        self.reachable_addrs: set[address_t] = set(self.mtus.keys())
 
 
-def ip_to_int(ip: str) -> int:
-    return int.from_bytes(socket.inet_aton(socket.gethostbyname(ip)))
+    def get_mtu(self, addr: address_t) -> int:
+        return self.mtus[addr]
+    
+    def is_empty(self) -> bool:
+        return len(self.direct_links) == 0
 
-def int_to_ip(ip: int) -> str:
-    return socket.inet_ntoa(ip.to_bytes(4))
+    @typing.override
+    def __str__(self) -> str:
+        result = "Estado actual de la tabla de rutas:\n"
+        
+        for addr, dist in self.distances.items():
+            result += f"destino: {addr[0]}:{addr[1]} | saltos: {dist}\n"
+            result += f" - entutar por: {self.routing_table[addr]}"
+
+        return result
+
+    def reachable(self, addr: address_t) -> bool:
+        return addr in self.reachable_addrs
+        
+
+    def add_path(self, dst_addr: address_t, next_addr:address_t,
+                 distance: int) -> None:
+        if dst_addr in self.reachable_addrs:
+            prev_distance = self.distances[dst_addr]
+
+            if distance < prev_distance:
+                self.routing_table[dst_addr] = [next_addr]
+                self.distances[dst_addr] = distance
+
+            elif prev_distance == distance:
+                self.routing_table[dst_addr].append(next_addr)
+
+        else:
+            self.reachable_addrs.add(dst_addr)
+            self.routing_table[dst_addr] = [next_addr]
+            self.distances[dst_addr] = distance
+    
+    def get_path(self, dst_addr: address_t) -> list[address_t] | None:
+        if dst_addr in self.reachable_addrs:
+            return self.routing_table[dst_addr]
+        else:
+            return None
 
 
-def recieve_messages(address: tuple[str, int],
+    def add_direct_link(self, addr: address_t, mtu:int) -> None:
+        if addr not in self.direct_links:
+            self.mtus[addr] = mtu
+            self.direct_links.add(addr)
+            if mtu > self.max_mtu:
+                self.max_mtu = mtu
+
+            self.add_path(addr, addr, 1)
+
+
+    def pack(self) -> bytes:
+        packed_table: bytes = b''
+        for (ip, port), dist in self.distances.items():
+            packed_table += socket.inet_aton(ip) + port.to_bytes() + dist.to_bytes()
+
+        return packed_table
+
+    def update(self, header: Header, data: bytes) -> None:
+        sender_addr: address_t = (int_to_ip(header.ip), header.port)
+        self.add_direct_link(sender_addr, header.ttl)
+
+        for entry in [data[i: i+12] for i in range(0, len(data), 12)]:
+            ip = socket.inet_ntoa(entry[0:4])
+            port = int.from_bytes(entry[4:8])
+            dist = int.from_bytes(entry[8:12])
+
+            self.add_path((ip, port), sender_addr, dist)
+
+
+def recieve_messages(address: address_t,
                      message_queue: queue.Queue[bytes], 
                      continue_event: threading.Event) -> None:
     reciever_soc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -138,7 +247,7 @@ def recieve_messages(address: tuple[str, int],
 # esta funcion añade un retardo pequeño cada 10 mensajes para 
 # no sobrecargar la cola de mensajes del kernel
 wait_before_send = 0
-def send_message(soc: socket.socket, msg: bytes, addr: tuple[str, int]) -> None:
+def send_message(soc: socket.socket, msg: bytes, addr: address_t) -> None:
     global wait_before_send
 
     if wait_before_send >= 10:
@@ -147,7 +256,7 @@ def send_message(soc: socket.socket, msg: bytes, addr: tuple[str, int]) -> None:
 
     wait_before_send += 1
     _ = soc.sendto(msg, addr)
-    
+
 
 def start_as_sender(filename: str, arg_src: str, arg_dst: str, arg_ttl: str) -> None:
     try:
@@ -196,38 +305,17 @@ def start_as_sender(filename: str, arg_src: str, arg_dst: str, arg_ttl: str) -> 
     print("Mensaje enviado", file=sys.stderr)
 
 
-def start_as_router(arg_addr: str, linked_addrs: list[str]):
+def start_as_router(router_addr: str, linked_addrs: list[str]):
     try: 
-        arg_ip, arg_port = arg_addr.split(':', maxsplit=1)
-        my_addr = (socket.gethostbyname(arg_ip), int(arg_port))
+        router_ip, router_port = router_addr.split(':', maxsplit=1)
+        my_addr = (socket.gethostbyname(router_ip), int(router_port))
 
     except:
-        print(f"Error de format en la dirección '{arg_addr}'", file=sys.stderr)
+        print(f"Error de format en la dirección '{router_addr}'", file=sys.stderr)
         exit(1)
 
-    mtus: dict[tuple[str, int], int] = dict()
-
-    for link in linked_addrs:
-        try: 
-            parts = link.split(':', maxsplit=2)
-            ip = socket.gethostbyname(parts[0])
-            port = int(parts[1])
-            mtu = int(parts[2])
-
-            if mtu <= HEADER_LEN:
-                print(f"""Error en el argumento '{link}', todos los MTUs deben ser mayores
- al tamaño del header ({HEADER_LEN} bytes)""", file=sys.stderr)
-                exit(1)
-
-            mtus[(ip,port)] = mtu
-
-        except:
-            print(f"Error de formato en el argumento '{link}'", file=sys.stderr)
-            exit(1)
-
-    links: list[tuple[str,int]] = list(mtus.keys())
-    max_mtu = max(mtus.values()) if len(mtus) > 0 else 0
-
+    sender_soc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    segments = Defragmenter()
 
     # Un thread separado se encarga de recibir los mensajes para
     # evitar sobrecargar la cola del kernel
@@ -239,11 +327,12 @@ def start_as_router(arg_addr: str, linked_addrs: list[str]):
                                        daemon=True)
     reciever_thread.start()
 
-    sender_soc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    routing_table = RoutingTable(linked_addrs)
+    print(routing_table)
+
+    seen_ctrl_msgs: dict[int, float] = dict()
 
     try:
-        segments = Defragmenter()
-
         while True:
             msg = msg_queue.get()
 
@@ -256,12 +345,23 @@ def start_as_router(arg_addr: str, linked_addrs: list[str]):
 
             header.ttl -= 1
 
-            if dst_addr == my_addr:
+            if header.protocol == CONTROL_PROTOCOL:
+                if header.id in seen_ctrl_msgs.keys():
+                    if time.time() - 
+
+                routing_table.update(header, data)
+                print(routing_table)
+
+                control_msgs_recieved[header.id] = time.time()
+
+                # ENViAR AL RESTO
+
+            elif dst_addr == my_addr:
                 full_msg = segments.add_segment(header, data)
                 if full_msg != None:
                     _ = os.write(sys.stdout.fileno(), full_msg)
 
-            elif header.ttl == 0 or max_mtu == 0:
+            elif header.ttl == 0 or not routing_table.reachable(dst_addr):
                 continue
             
             elif dst_addr in links and len(msg) <= mtus[dst_addr]:
@@ -302,7 +402,6 @@ def start_as_router(arg_addr: str, linked_addrs: list[str]):
         reciever_thread.join()
         print("conección cerrada", file=sys.stderr)
         exit()
-
 
 
 flag = "--enviar"
