@@ -12,11 +12,12 @@ Como se especifica en el enunciado, la tarea se debe ejecutar en varias terminal
 de manera simultanea para crear una red:
 
 ```bash
-python3 fragmentizador.py 127.0.0.1:55551 127.0.0.1:55552:2000 127.0.0.1:55553:3000
-python3 fragmentizador.py 127.0.0.1:55552 127.0.0.1:55553:3000 127.0.0.1:55554:4000
-python3 fragmentizador.py 127.0.0.1:55553 127.0.0.1:55554:4000
-python3 fragmentizador.py 127.0.0.1:55554 127.0.0.1:55555:5000
-python3 fragmentizador.py 127.0.0.1:55555 127.0.0.1:55551:1000
+python3 fragmentizador.py 127.0.0.1:8001 127.0.0.1:8002:256
+python3 fragmentizador.py 127.0.0.1:8002 127.0.0.1:8003:256 127.0.0.1:8004:256
+python3 fragmentizador.py 127.0.0.1:8003 127.0.0.1:8005:256
+python3 fragmentizador.py 127.0.0.1:8004 127.0.0.1:8005:256
+python3 fragmentizador.py 127.0.0.1:8005 127.0.0.1:8006:256
+python3 fragmentizador.py 127.0.0.1:8006
 ```
 
 Los datagramas que pasan por la red necesitan que cada segmento tenga un header

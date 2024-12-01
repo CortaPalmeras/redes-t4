@@ -19,6 +19,8 @@ RECIEVER_TIMEOUT = 0.5
 BUFFSIZE = 2 ** 15
 
 MSG_DEFRAG_TIMEOUT = 1
+SEEN_CTRL_MSG_TIMEOUT = 1
+COMPLETE_TABLE_TIMEOUT = 2
 
 
 class Header:
@@ -37,6 +39,7 @@ class Header:
 
         self.id = id
         self.ttl = ttl
+
 
 def pack_header(header: Header) -> bytes:
     return struct.pack(f"{HEADER_FIELDS}I", header.protocol,
@@ -120,8 +123,8 @@ class Defragmenter:
 address_t: typing.TypeAlias = tuple[str, int]
 
 class RoutingTable:
-    def __init__(self, linked_addrs: list[str]) -> None:
-
+    def __init__(self, this_addr: address_t, linked_addrs: list[str]) -> None:
+        self.this_addr = this_addr
         self.mtus: dict[address_t, int] = dict()
 
         for link in linked_addrs:
@@ -132,7 +135,7 @@ class RoutingTable:
                 mtu = int(parts[2])
 
                 if mtu <= HEADER_LEN:
-                    print((f"Error en el argumento '{link}', todos los MTUs deben"
+                    print((f"Error en el argumento '{link}', todos los MTUs deben "
                            f"ser mayores al tamaño del header ({HEADER_LEN} bytes)"),
                           file=sys.stderr)
                     exit(1)
@@ -143,6 +146,7 @@ class RoutingTable:
                 print(f"Error de formato en el argumento '{link}'", file=sys.stderr)
                 exit(1)
 
+        self.argument_links: set[address_t] = set(self.mtus.keys())
         self.direct_links: set[address_t] = set(self.mtus.keys())
         self.max_mtu = max(self.mtus.values()) if len(self.mtus) > 0 else 0
 
@@ -156,25 +160,26 @@ class RoutingTable:
     def get_mtu(self, addr: address_t) -> int:
         return self.mtus[addr]
     
-    def is_empty(self) -> bool:
-        return len(self.direct_links) == 0
-
-    @typing.override
-    def __str__(self) -> str:
-        result = "Estado actual de la tabla de rutas:\n"
-        
+    def to_str(self) -> str:
+        result = ""
         for addr, dist in self.distances.items():
-            result += f"destino: {addr[0]}:{addr[1]} | saltos: {dist}\n"
-            result += f" - entutar por: {self.routing_table[addr]}"
+            result += f"destino: {addr[0]}:{addr[1]}\n"
+            result += f"    distancia: {dist}\n"
+            offset = f"    enrutar por: "
+            for ip, port in self.routing_table[addr]:
+                result += offset + f"- {ip}:{port}\n"
+                offset = f"                 "
 
         return result
 
     def reachable(self, addr: address_t) -> bool:
         return addr in self.reachable_addrs
         
-
     def add_path(self, dst_addr: address_t, next_addr:address_t,
                  distance: int) -> None:
+        if dst_addr == self.this_addr:
+            return
+
         if dst_addr in self.reachable_addrs:
             prev_distance = self.distances[dst_addr]
 
@@ -182,7 +187,8 @@ class RoutingTable:
                 self.routing_table[dst_addr] = [next_addr]
                 self.distances[dst_addr] = distance
 
-            elif prev_distance == distance:
+            elif prev_distance == distance \
+                and next_addr not in self.routing_table[dst_addr]:
                 self.routing_table[dst_addr].append(next_addr)
 
         else:
@@ -190,11 +196,32 @@ class RoutingTable:
             self.routing_table[dst_addr] = [next_addr]
             self.distances[dst_addr] = distance
     
-    def get_path(self, dst_addr: address_t) -> list[address_t] | None:
-        if dst_addr in self.reachable_addrs:
-            return self.routing_table[dst_addr]
+    def get_directions(self, dst_addr: address_t, data_size: int) -> list[tuple[address_t, int]]:
+        paths = self.routing_table[dst_addr]
+        ideal_path_index = -1
+
+        for index, addr in enumerate(paths):
+            if self.mtus[addr] - HEADER_LEN >= data_size:
+                ideal_path_index = index
+                break
+
+        if ideal_path_index != -1:
+            ideal_path = paths.pop(ideal_path_index)
+            paths.append(ideal_path)
+            return [(ideal_path, self.mtus[ideal_path])]
+
         else:
-            return None
+            distributed_bytes = 0
+            directions: list[tuple[address_t, int]] = list()
+
+            while distributed_bytes < data_size:
+                addr = paths.pop(0)
+                paths.append(addr)
+                mtu = self.mtus[addr]
+                directions.append((addr, mtu))
+                distributed_bytes += mtu - HEADER_LEN
+
+            return directions
 
 
     def add_direct_link(self, addr: address_t, mtu:int) -> None:
@@ -206,11 +233,19 @@ class RoutingTable:
 
             self.add_path(addr, addr, 1)
 
+        elif addr in self.argument_links:
+            self.argument_links.remove(addr)
+
+    def is_complete(self) -> bool:
+        return len(self.argument_links) == 0
+
+    def get_direct_links(self) -> list[tuple[address_t, int]]:
+        return list(self.mtus.items())
 
     def pack(self) -> bytes:
         packed_table: bytes = b''
         for (ip, port), dist in self.distances.items():
-            packed_table += socket.inet_aton(ip) + port.to_bytes() + dist.to_bytes()
+            packed_table += socket.inet_aton(ip) + port.to_bytes(4) + dist.to_bytes(4)
 
         return packed_table
 
@@ -223,7 +258,7 @@ class RoutingTable:
             port = int.from_bytes(entry[4:8])
             dist = int.from_bytes(entry[8:12])
 
-            self.add_path((ip, port), sender_addr, dist)
+            self.add_path((ip, port), sender_addr, dist + 1)
 
 
 def recieve_messages(address: address_t,
@@ -327,74 +362,79 @@ def start_as_router(router_addr: str, linked_addrs: list[str]):
                                        daemon=True)
     reciever_thread.start()
 
-    routing_table = RoutingTable(linked_addrs)
-    print(routing_table)
+    routing_table = RoutingTable(my_addr, linked_addrs)
+    print(f"Tabla de rutas:\n{routing_table.to_str()}", file=sys.stderr)
+
+    def routing_table_sendall(id: int) -> None:
+        routing_data = routing_table.pack()
+
+        ctrl_header = Header(protocol=CONTROL_PROTOCOL, 
+                        ip=ip_to_int(my_addr[0]), port=my_addr[1], 
+                        size=HEADER_LEN + len(routing_data), offset=0,
+                        id=id, ttl=0)
+
+        for addr, mtu in routing_table.get_direct_links():
+            ctrl_header.ttl = mtu
+            send_message(sender_soc, pack_header(ctrl_header) + routing_data, addr)
+
+    routing_table_sendall(random.randint(0, (1 << 32) - 1))
 
     seen_ctrl_msgs: dict[int, float] = dict()
 
+    def getfunc() -> bytes:
+        if routing_table.is_complete():
+            return msg_queue.get()
+        else:
+            while True:
+                try:
+                    return msg_queue.get(timeout=COMPLETE_TABLE_TIMEOUT)
+                except queue.Empty:
+                    routing_table_sendall(random.randint(0, (1 << 32) - 1))
+
     try:
         while True:
-            msg = msg_queue.get()
+            msg = getfunc()
 
             if len(msg) <= HEADER_LEN:
                 continue
 
-            data = msg[HEADER_LEN:]
             header = unpack_header(msg[:HEADER_LEN])
+            data = msg[HEADER_LEN:]
             dst_addr = (int_to_ip(header.ip), header.port)
 
             header.ttl -= 1
 
             if header.protocol == CONTROL_PROTOCOL:
-                if header.id in seen_ctrl_msgs.keys():
-                    if time.time() - 
+                if header.id in seen_ctrl_msgs.keys() \
+                    and time.time() - seen_ctrl_msgs[header.id] <= SEEN_CTRL_MSG_TIMEOUT:
+                    continue
+
+                seen_ctrl_msgs[header.id] = time.time()
 
                 routing_table.update(header, data)
-                print(routing_table)
+                print(f"Tabla de rutas actualizada:\n{routing_table.to_str()}", file=sys.stderr)
+                
+                routing_table_sendall(header.id)
 
-                control_msgs_recieved[header.id] = time.time()
-
-                # ENViAR AL RESTO
 
             elif dst_addr == my_addr:
                 full_msg = segments.add_segment(header, data)
                 if full_msg != None:
                     _ = os.write(sys.stdout.fileno(), full_msg)
 
-            elif header.ttl == 0 or not routing_table.reachable(dst_addr):
-                continue
-            
-            elif dst_addr in links and len(msg) <= mtus[dst_addr]:
-                _ = send_message(sender_soc, pack_header(header) + data, dst_addr)
-                links.remove(dst_addr)
-                links.append(dst_addr)
-
-            # si existe agun enlace por el cual quepa el mensaje completo,
-            # se busca por cual y se le evia, luego el enlace se mueve al
-            # final de la lista de enlaces para que se vayan rotando
-            elif len(msg) <= max_mtu:
-                i = 0
-                while mtus[links[i]] < len(msg):
-                    i += 1
-
-                _ = send_message(sender_soc, pack_header(header) + data, links[i])
-                links.append(links.pop(i))
-
-            # si el mensaje no cabe en ningún enlace entonces se fragmenta y 
-            # distribuye entre todos los enlaces
-            else:
+            elif header.ttl > 0 and routing_table.reachable(dst_addr):
+                next_addrs = routing_table.get_directions(dst_addr, len(data))
                 sent_data = 0
-                while sent_data < len(data):
-                    next_addr = links.pop(0)
-                    links.append(next_addr)
 
-                    fragment_size = mtus[next_addr] - HEADER_LEN
-                    fragment_data = data[sent_data : sent_data + fragment_size]
+                for addr, mtu in next_addrs:
+                    data_size = mtu - HEADER_LEN
 
-                    _ = send_message(sender_soc, pack_header(header) + fragment_data, next_addr)
+                    datagram = pack_header(header) + data[sent_data: sent_data + data_size]
+                    send_message(sender_soc, datagram, addr)
 
-                    sent_data += fragment_size
-                    header.offset += fragment_size
+                    header.offset += data_size
+                    sent_data += data_size
+
 
     except KeyboardInterrupt:
         sender_soc.close()
