@@ -29,16 +29,16 @@ class Header:
                  size: int, offset: int,
                  id: int, ttl: int) -> None:
 
-        self.protocol = protocol
+        self.protocol: int = protocol
 
-        self.ip = ip
-        self.port = port
+        self.ip: int = ip
+        self.port: int = port
 
-        self.size = size
-        self.offset = offset
+        self.size: int = size
+        self.offset: int = offset
 
-        self.id = id
-        self.ttl = ttl
+        self.id: int = id
+        self.ttl: int = ttl
 
 
 def pack_header(header: Header) -> bytes:
@@ -124,7 +124,7 @@ address_t: typing.TypeAlias = tuple[str, int]
 
 class RoutingTable:
     def __init__(self, this_addr: address_t, linked_addrs: list[str]) -> None:
-        self.this_addr = this_addr
+        self.this_addr: address_t = this_addr
         self.mtus: dict[address_t, int] = dict()
 
         for link in linked_addrs:
@@ -148,7 +148,7 @@ class RoutingTable:
 
         self.argument_links: set[address_t] = set(self.mtus.keys())
         self.direct_links: set[address_t] = set(self.mtus.keys())
-        self.max_mtu = max(self.mtus.values()) if len(self.mtus) > 0 else 0
+        self.max_mtu: int = max(self.mtus.values()) if len(self.mtus) > 0 else 0
 
         self.routing_table: dict[address_t, list[address_t]] \
                             = {addr: [addr] for addr in self.mtus.keys()}
